@@ -1,5 +1,18 @@
+# Virtual environment
 .venv/
+
+# Python cache
 __pycache__/
 *.py[cod]
+
+# Environment variables
 .env
-supportiq.db
+
+# Local databases
+*.db
+
+# Test cache
+.pytest_cache/
+
+# IDE
+.vscode/
