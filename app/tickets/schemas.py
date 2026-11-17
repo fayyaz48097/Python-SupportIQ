@@ -1,6 +1,9 @@
+
 from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from app.tickets.enums import TicketStatus
 
 
 class TicketCreate(BaseModel):
@@ -13,8 +16,9 @@ class TicketCreate(BaseModel):
 class TicketResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
-    id: str
+    id: int
     subject: str
     message: str
-    status: str
+    status: TicketStatus
     created_at: datetime
+    updated_at: datetime

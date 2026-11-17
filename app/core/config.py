@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     db_user: str
     db_password: str
 
+    migration_db_user: str | None = None
+    migration_db_password: str | None = None
+
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",
         env_file_encoding="utf-8",

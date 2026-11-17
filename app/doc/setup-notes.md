@@ -19,6 +19,7 @@
 9. [Common errors & fixes](#9-common-errors--fixes)
 10. [Interview questions & answers](#10-interview-questions--answers)
 11. [Command cheat sheet](#11-command-cheat-sheet)
+12. [MySQL (Laragon) + Alembic — real setup & troubleshooting log](#12-mysql-laragon--alembic--real-setup--troubleshooting-log)
 
 ---
 
@@ -525,6 +526,14 @@ Usage: `from app.core.config import settings` → `settings.DATABASE_URL`.
 | `sqlite3.OperationalError: no such column` | Model changed, table didn't | Use Alembic migration (or delete `supportiq.db` in dev only) |
 | `SQLite objects created in a thread can only be used in that same thread` | Missing `check_same_thread` | Add `connect_args={"check_same_thread": False}` |
 | `requirements.txt` shows as binary in Git | Saved as UTF-16 by PowerShell | Re-save as UTF-8 |
+| `Access denied for user '...' (using password: NO)` | Password is empty in `.env` — nothing was sent | Fill in the `DB_PASSWORD` value in `.env` |
+| `Access denied for user '...' (using password: YES)` | Password was sent but doesn't match MySQL (or the user doesn't exist) | Reset with `ALTER USER` / create with `CREATE USER` |
+| `FAILED: Directory migrations already exists and is not empty` | `alembic init` run on an existing folder | Don't re-run init if `env.py` already exists |
+| `MissingSectionHeaderError ... alembic.ini` | `alembic.ini` has no `[alembic]` section | Use the full `alembic.ini` (see section 12) |
+| `KeyError: 'formatters'` | `alembic.ini` missing logging sections, but `env.py` calls `fileConfig()` | Add `[loggers]`, `[handlers]`, `[formatters]` sections |
+| `'cryptography' package is required for sha256_password or caching_sha2_password` | MySQL 8 auth method needs it in PyMySQL | `pip install cryptography` |
+
+> 👉 The full story of the MySQL + Alembic errors is in [section 12](#12-mysql-laragon--alembic--real-setup--troubleshooting-log).
 
 ---
 
@@ -598,6 +607,21 @@ SQLite is a single file with no server — perfect for learning, prototyping, te
 
 **Q: Why UUIDs as primary keys?**
 Not guessable, globally unique, can be generated without asking the database. Trade-off: bigger than integers and slightly slower for indexes.
+
+**Q: Why use two database users (app user and migration user)?**
+**Principle of least privilege.** The running app only needs to read/write rows (`SELECT, INSERT, UPDATE, DELETE`). Only migrations need to change the structure (`CREATE, ALTER, DROP, INDEX`). If the app is ever hacked (e.g. SQL injection), the attacker can't drop tables.
+
+**Q: What is the `alembic_version` table?**
+A one-row table Alembic creates in your database. It stores the revision ID of the last applied migration. `alembic upgrade head` compares it with the files in `migrations/versions/` and runs only the missing ones.
+
+**Q: What is the difference between `alembic revision --autogenerate` and `alembic upgrade head`?**
+`revision --autogenerate` compares your models with the database and **writes a migration file** — it changes nothing in the DB. `upgrade head` **runs** the pending migration files against the database.
+
+**Q: Can you fully trust autogenerate?**
+No — always review the file. It can't detect column/table **renames** (it sees a drop + add, which loses data), and it misses some changes like certain server defaults or constraint names.
+
+**Q: What does "Access denied ... (using password: NO)" vs "(using password: YES)" tell you?**
+Both mean the server was reached, but login failed. `NO` = the client sent no password (empty config value). `YES` = a password was sent but didn't match the account (wrong password, wrong host, or user doesn't exist).
 
 ### Project & architecture
 
@@ -687,6 +711,207 @@ git checkout -b feature/name
 git add .
 git commit -m "message"
 ```
+
+---
+
+## 12. MySQL (Laragon) + Alembic — real setup & troubleshooting log
+
+> This section records what actually happened while moving SupportIQ from SQLite to MySQL and creating the first migration — every error, why it happened, and how it was fixed.
+
+### 12.1 The setup we ended with
+
+| Item | Value |
+|---|---|
+| Database server | MySQL **8.4.3** (Laragon) on `127.0.0.1:3306` |
+| Database | `support_iq` |
+| Driver | **PyMySQL** → URL starts with `mysql+pymysql://` |
+| App user | `supportiq_app` — only `SELECT, INSERT, UPDATE, DELETE` |
+| Migration user | `supportiq_migrator` — also `CREATE, ALTER, DROP, INDEX, REFERENCES` |
+| First migration | `55d069023c2e_create_tickets_table.py` |
+
+**Why two users?** *Least privilege:* the running app can only touch rows; only migrations can change table structure. If the app gets hacked, nobody can `DROP TABLE` through it.
+
+### 12.2 Creating the MySQL users (run as `root` in phpMyAdmin)
+
+```sql
+-- App user: used by FastAPI at runtime
+CREATE USER 'supportiq_app'@'127.0.0.1' IDENTIFIED BY 'app-password-here';
+GRANT SELECT, INSERT, UPDATE, DELETE ON support_iq.* TO 'supportiq_app'@'127.0.0.1';
+
+-- Migration user: used only by Alembic
+CREATE USER 'supportiq_migrator'@'127.0.0.1' IDENTIFIED BY 'migrator-password-here';
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, REFERENCES
+ON support_iq.* TO 'supportiq_migrator'@'127.0.0.1';
+
+-- Useful checks
+SELECT user, host FROM mysql.user WHERE user LIKE 'supportiq%';
+SHOW GRANTS FOR 'supportiq_app'@'127.0.0.1';
+
+-- Forgot a password? Just reset it (no need to know the old one)
+ALTER USER 'supportiq_app'@'127.0.0.1' IDENTIFIED BY 'new-password';
+```
+
+> **MySQL user = name + host.** `'supportiq_app'@'127.0.0.1'` and `'supportiq_app'@'localhost'` are **two different accounts** to MySQL.
+> Error messages may show `@'localhost'` even when you connect to `127.0.0.1` — MySQL is just printing the resolved hostname.
+
+### 12.3 `.env` for MySQL
+
+```
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_NAME=support_iq
+DB_USER=supportiq_app
+DB_PASSWORD=...
+
+MIGRATION_DB_USER=supportiq_migrator
+MIGRATION_DB_PASSWORD=...
+```
+
+`.env` rules:
+- No spaces around `=`.
+- If a value contains `#`, wrap it in quotes: `DB_PASSWORD="abc#123"` (otherwise `#...` is treated as a comment and cut off).
+- Special characters like `@` or `:` are fine — `URL.create()` in `session.py` / `env.py` escapes them. (Building the URL with an f-string would break on them.)
+
+### 12.4 A correct `alembic.ini`
+
+```ini
+[alembic]
+script_location = migrations
+prepend_sys_path = .
+path_separator = os
+
+# No sqlalchemy.url here — env.py builds it from .env,
+# so the password never goes into Git.
+
+[loggers]
+keys = root,sqlalchemy,alembic
+
+[handlers]
+keys = console
+
+[formatters]
+keys = generic
+
+[logger_root]
+level = WARNING
+handlers = console
+qualname =
+
+[logger_sqlalchemy]
+level = WARNING
+handlers =
+qualname = sqlalchemy.engine
+
+[logger_alembic]
+level = INFO
+handlers =
+qualname = alembic
+
+[handler_console]
+class = StreamHandler
+args = (sys.stderr,)
+level = NOTSET
+formatter = generic
+
+[formatter_generic]
+format = %(levelname)-5.5s [%(name)s] %(message)s
+datefmt = %H:%M:%S
+```
+
+| Line | Why it matters |
+|---|---|
+| `[alembic]` | `.ini` files need a section header — without it: `MissingSectionHeaderError` |
+| `script_location = migrations` | Tells Alembic where `env.py` and `versions/` live |
+| `prepend_sys_path = .` | Adds the project root to Python's path so `from app...` works in `env.py` |
+| Logging sections | `env.py` calls `fileConfig()`, which needs them — otherwise `KeyError: 'formatters'` |
+
+Also needed: the folder **`migrations/versions/`** — Alembic writes new migration files there.
+
+### 12.5 How `migrations/env.py` works (our version)
+
+```python
+from app.core.config import settings
+from app.db.base import Base
+from app.tickets import models  # noqa: F401  ← registers the Ticket table on Base.metadata
+
+target_metadata = Base.metadata   # what autogenerate compares the DB against
+```
+
+- It builds the URL with `URL.create(...)` using `MIGRATION_DB_USER` / `MIGRATION_DB_PASSWORD`.
+- It raises a clear `RuntimeError` if those are missing.
+- It uses `NullPool` — migrations are a one-off script, so no connection pool is needed.
+- `compare_type=True` — autogenerate also detects **column type changes** (e.g. `String(100)` → `String(150)`).
+
+> ⚠️ **Every model must be imported in `env.py`.** If a model isn't imported, autogenerate thinks the table should not exist.
+
+### 12.6 The errors we hit — in order
+
+**Error 1 — `Access denied for user 'supportiq_app'@'localhost' (using password: NO)`**
+- **Why:** `DB_PASSWORD=` was empty in `.env`. `using password: NO` = Python sent no password at all.
+- **How we found it:** loaded `settings` in Python and checked `len(settings.db_password)` → `0`.
+- **Fix:** reset the user's password in phpMyAdmin with `ALTER USER`, and put the same value in `.env`.
+- **Prevention:** `db_password: str = Field(min_length=1)` in `config.py` → the app fails at startup with a clear message instead of a confusing MySQL error.
+
+**Error 2 — `FAILED: Directory migrations already exists and is not empty`**
+- **Why:** `alembic init migrations` wants to create a new folder, but `migrations/` already existed.
+- **Fix:** nothing to fix — `env.py` was already there. `init` is a **one-time** command.
+
+**Error 3 — `configparser.MissingSectionHeaderError ... alembic.ini, line 1: 'sqlalchemy.url ='`**
+- **Why:** `alembic.ini` contained only `sqlalchemy.url =` — no `[alembic]` section, no `script_location`.
+- **Fix:** full `alembic.ini` from 12.4, plus `mkdir migrations\versions`.
+
+**Error 4 — `Access denied for user 'supportiq_migrator'@'localhost' (using password: YES)`**
+- **Why:** the password was sent (`YES`) and loaded correctly from `.env` (15 characters, no `#`/spaces), but MySQL had a **different password** for that user (or the user didn't exist).
+- **How we found it:** the app user connected fine → server, host and DB were OK → the problem was only this one account.
+- **Fix:** `ALTER USER 'supportiq_migrator'@'127.0.0.1' IDENTIFIED BY '<same as .env>';` (or `CREATE USER` + `GRANT`).
+
+**✅ Result:**
+```
+alembic revision --autogenerate -m "create tickets table"
+  → Detected added table 'tickets'
+  → Generating migrations/versions/55d069023c2e_create_tickets_table.py
+
+alembic upgrade head
+  → Running upgrade  -> 55d069023c2e, create tickets table
+```
+Database now has `tickets` and `alembic_version` (value `55d069023c2e`).
+
+### 12.7 How to debug "Access denied" — a checklist
+
+1. Read the end of the error: **`password: NO`** → config value empty. **`password: YES`** → value doesn't match MySQL.
+2. Check what Python actually loads (never print the password itself):
+   ```powershell
+   python -c "from app.core.config import settings as s; print(s.db_host, s.db_port, s.db_name, s.db_user, len(s.db_password))"
+   ```
+3. Try another user that's known to work — if it works, the server is fine and the problem is that one account.
+4. In phpMyAdmin: `SELECT user, host FROM mysql.user;` — does the user exist, and with which host?
+5. Reset the password with `ALTER USER` and copy the exact same value into `.env`.
+
+### 12.8 Everyday migration workflow
+
+```powershell
+# 1. Change a model (e.g. add a column in app/tickets/models.py)
+# 2. Generate the migration file
+alembic revision --autogenerate -m "add priority to tickets"
+# 3. OPEN and REVIEW the new file in migrations/versions/
+# 4. Apply it
+alembic upgrade head
+# 5. Commit the model change AND the migration file together
+```
+
+| Command | What it does |
+|---|---|
+| `alembic current` | Which revision is the DB on now? |
+| `alembic history` | List all migrations |
+| `alembic downgrade -1` | Undo the last migration (runs `downgrade()`) |
+| `alembic upgrade head --sql` | Print the SQL without running it (good for review) |
+
+**Things to remember**
+- `revision` only **writes a file**; `upgrade` **changes the database**. Never skip reviewing the file in between.
+- Autogenerate can't detect **renames** — a renamed column looks like "drop old + add new" and the **data is lost**. Edit the file to use `op.alter_column(..., new_column_name=...)` instead.
+- Migration files are **code** — always commit them.
+- MySQL `DATETIME` has **no timezone**: `DateTime(timezone=True)` became plain `datetime`. We store UTC, so treat values read back as UTC.
+- MySQL 8's default login uses `caching_sha2_password`. If PyMySQL says the `cryptography` package is required → `pip install cryptography`.
 
 ---
 
