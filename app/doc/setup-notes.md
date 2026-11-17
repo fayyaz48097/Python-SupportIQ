@@ -697,9 +697,13 @@ fastapi dev app/main.py                          # FastAPI CLI (dev)
 fastapi run app/main.py                          # FastAPI CLI (production mode)
 
 # Alembic
-alembic revision --autogenerate -m "message"
-alembic upgrade head
-alembic downgrade -1
+alembic revision --autogenerate -m "message"   # create migration file
+alembic upgrade head                            # apply to database
+alembic downgrade -1                            # undo last migration
+alembic history                                 # list all migrations (files)
+alembic current                                 # which migration the DB is on
+alembic check                                   # do models differ from DB?
+alembic heads                                   # latest migration in files
 
 # Tests
 pip install pytest
@@ -912,6 +916,113 @@ alembic upgrade head
 - Migration files are **code** — always commit them.
 - MySQL `DATETIME` has **no timezone**: `DateTime(timezone=True)` became plain `datetime`. We store UTC, so treat values read back as UTC.
 - MySQL 8's default login uses `caching_sha2_password`. If PyMySQL says the `cryptography` package is required → `pip install cryptography`.
+
+### 12.9 Inspection commands — `history`, `current`, `check`
+
+These three commands are **read-only** — they never change your database. Use them to answer: *"What migrations exist? Where is my database? Is anything pending?"*
+
+| Command | Question it answers | Looks at | Needs DB connection? |
+|---|---|---|---|
+| `alembic history` | What migrations **exist**? | Files in `migrations/versions/` | ❌ No |
+| `alembic current` | Which migration is the **database** on? | `alembic_version` table | ✅ Yes |
+| `alembic check` | Do my **models** differ from the **database**? | Models vs real tables | ✅ Yes |
+
+#### `alembic history` — list all migrations
+
+Shows the chain of migration files, **newest first**. Read each line as `parent -> revision, message`.
+
+```
+> alembic history
+55d069023c2e -> 875c5bc71802 (head), update ticket id status and timestamps
+<base> -> 55d069023c2e, create tickets table
+```
+
+| Part | Meaning |
+|---|---|
+| `<base>` | The empty starting point (before any migration) |
+| `55d069023c2e -> 875c5bc71802` | `875c5bc71802` was built **on top of** `55d069023c2e` (its `down_revision`) |
+| `(head)` | The **latest** migration — what `upgrade head` goes to |
+
+Useful options:
+```powershell
+alembic history --verbose          # also shows file path + create date of each migration
+alembic history -r current:head    # only migrations NOT yet applied to the database
+```
+
+> It only reads files — it **doesn't** tell you what's applied. For that, use `current`.
+
+#### `alembic current` — where is the database right now?
+
+Reads the single row in the `alembic_version` table and prints that revision.
+
+```
+> alembic current
+875c5bc71802 (head)
+```
+
+| Output | Meaning | What to do |
+|---|---|---|
+| `875c5bc71802 (head)` | DB is **up to date** ✅ | Nothing |
+| `55d069023c2e` (no `(head)`) | DB is **behind** — a migration exists but wasn't applied | `alembic upgrade head` |
+| *(empty)* | No migration ever applied | `alembic upgrade head` |
+
+```powershell
+alembic current --verbose    # also shows the DB URL (password hidden as ***), parent and file path
+```
+
+> 💡 **Real example from this project:** a migration file was generated with `revision --autogenerate`, but the table didn't change. `alembic current` showed `55d069023c2e` while `alembic heads` showed `875c5bc71802 (head)` → proof that `upgrade head` hadn't been run yet.
+
+#### `alembic check` — are models and database in sync?
+
+Runs the same comparison as `--autogenerate`, but **doesn't create a file**. It just reports.
+
+```
+> alembic check
+No new upgrade operations detected.
+```
+✅ Models and database match — no new migration needed.
+
+If you changed a model and forgot to make a migration:
+```
+> alembic check
+ERROR [alembic.util.messaging] New upgrade operations detected: [('add_column', None, 'tickets', Column('priority', ...))]
+  FAILED: New upgrade operations detected: ...
+```
+❌ Means: run `alembic revision --autogenerate -m "..."` and then `alembic upgrade head`.
+
+If the database is behind (a migration file exists but isn't applied):
+```
+FAILED: Target database is not up to date.
+```
+❌ Means: run `alembic upgrade head` first, then check again.
+
+**Why it's useful:**
+- Quick "did I forget a migration?" test before committing.
+- In **CI/CD pipelines**: `alembic check` exits with an **error code** when something is out of sync, so the build fails before broken code reaches production.
+- Same limits as autogenerate — it won't notice renames and some default/constraint changes.
+
+#### Related commands
+
+| Command | What it does |
+|---|---|
+| `alembic heads` | Show the latest revision(s) **in the files** (compare with `current`) |
+| `alembic show 875c5bc71802` | Details of one specific migration |
+| `alembic upgrade head --sql` | Print the SQL that **would** run, without running it |
+
+#### Daily routine using them
+
+```powershell
+alembic current      # 1. Is my DB up to date?          → should say (head)
+# ... change a model ...
+alembic check        # 2. Did my model change need a migration? → "New upgrade operations detected"
+alembic revision --autogenerate -m "describe change"   # 3. create the file
+# ... open and review the file ...
+alembic upgrade head # 4. apply it
+alembic check        # 5. confirm → "No new upgrade operations detected."
+alembic history      # 6. see the new migration in the chain
+```
+
+**Interview line:** *"`history` shows what migrations exist, `current` shows what the database has applied, and `check` tells me whether my models have drifted from the database — I use `check` in CI so a missing migration fails the build."*
 
 ---
 
